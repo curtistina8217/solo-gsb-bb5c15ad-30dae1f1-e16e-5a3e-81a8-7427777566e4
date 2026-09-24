@@ -6,7 +6,14 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-EventType = Literal["note_on", "note_off", "pedal_down", "pedal_up"]
+EventType = Literal[
+    "note_on",
+    "note_off",
+    "pedal_down",
+    "pedal_up",
+    "sostenuto_down",
+    "sostenuto_up",
+]
 _NOTE_TYPES = {"note_on", "note_off"}
 
 
@@ -14,7 +21,7 @@ class EventIn(BaseModel):
     time_ms: int = Field(ge=0)
     channel: int
     type: EventType
-    # 仅 note_on / note_off 需要;踏板事件带了也会被忽略
+    # 仅 note_on / note_off 需要;两类踏板事件带了 pitch 也会被忽略
     pitch: int | None = None
 
     @model_validator(mode="after")
@@ -56,6 +63,7 @@ class EventError(BaseModel):
     # 事件在输入 events 中的下标,从 0 开始
     index: int
     # unpaired_note_off | pedal_already_down | pedal_already_up
+    # | sostenuto_already_down | sostenuto_already_up
     reason: str
 
 
@@ -72,7 +80,8 @@ class ChannelStats(BaseModel):
     peak_polyphony: int
     # 首次达到 peak_polyphony 的时刻;无正时长音时为 null
     peak_at_ms: int | None
-    # 松键后仅靠延音踏板延续的时长之和(松键时刻 -> 抬踏板或 end_ms)
+    # 松键后仅靠任一踏板(普通延音 / 选择性延音)延续的时长之和
+    # (松键时刻 -> 最后一块保持踏板抬起或 end_ms)
     sustained_duration_ms: int
 
 

@@ -4,12 +4,21 @@
 - 事件按输入顺序逐条处理(同一时刻也保持输入顺序)。
 - note_on: 在对应 (channel, pitch) 上生成一个新的发声区间,重复按键
   各自独立,松键按 FIFO 配对“最早仍按住”的 note_on。
-- note_off:
-    * 踏板未踩下 -> 该音立即截断;
-    * 踏板踩着   -> 记为“待释放”,继续发声。
-- pedal_down: 踩下该通道延音踏板;重复踩下是无效切换。
-- pedal_up:   抬起踏板,该通道全部待释放音在同一时刻截断;未踩下时抬起无效。
-- end_ms:     结束时刻,所有仍在发声的音(按住的、待释放的)统一在此截断。
+- note_off: 按 FIFO 配对松键,配对后:
+    * 当下没有任何踏板保持该音 -> 在松键时刻立即截断;
+    * 否则 -> 记为“松键后待释放”,声音继续,由当下踩着且能保持它的
+      踏板共同保持。普通延音踏板保持全部待释放音;选择性延音踏板只
+      保持踩下瞬间仍按住(被锁定)的音。
+- pedal_down: 踩下普通延音踏板;踩下后该通道仍在发声的待释放音
+  (含此前仅靠选择性踏板延续的音)也由它保持;重复踩下无效。
+- pedal_up:   抬起普通延音踏板,不再由它保持的待释放音在同一时刻
+  截断;仍被选择性踏板保持的音继续发声;未踩下时抬起无效。
+- sostenuto_down: 锁定该通道当下仍按住的全部音;重复踩下无效。
+  踩下之后新按的音不进入锁定集合。
+- sostenuto_up:   解除锁定;不再被任何踏板保持的待释放音在同一时刻
+  截断,仍由普通延音踏板保持的音继续发声;未踩下时抬起无效。
+- end_ms:     结束时刻,所有仍在发声的音(按住的、任一踏板待释放的)
+  统一在此截断。
 """
 
 from __future__ import annotations
@@ -20,8 +29,14 @@ from typing import Any, Iterable
 
 # 错误原因码
 UNPAIRED_NOTE_OFF = "unpaired_note_off"  # 没有可配对的 note_on(松键多于按键)
-PEDAL_ALREADY_DOWN = "pedal_already_down"  # 踏板已踩下,重复 pedal_down
-PEDAL_ALREADY_UP = "pedal_already_up"  # 踏板未踩下,无效 pedal_up
+PEDAL_ALREADY_DOWN = "pedal_already_down"  # 普通延音踏板已踩下,重复 pedal_down
+PEDAL_ALREADY_UP = "pedal_already_up"  # 普通延音踏板未踩下,无效 pedal_up
+SOSTENUTO_ALREADY_DOWN = "sostenuto_already_down"  # 选择性踏板已踩下,重复踩下
+SOSTENUTO_ALREADY_UP = "sostenuto_already_up"  # 选择性踏板未踩下,无效抬起
+
+# 保持者踏板标识
+_SUSTAIN = "sustain"      # 普通延音踏板
+_SOSTENUTO = "sostenuto"  # 选择性延音踏板
 
 
 @dataclass
@@ -32,9 +47,14 @@ class _Voice:
     pitch: int
     start_ms: int
     end_ms: int | None = None
-    # 踩着踏板松键的时刻;None 表示未经历“松键后踏板延续”,
+    # 松键时刻;None 表示键仍按住(或已随松键立即结束),
     # 用于计算 sustained_duration_ms
     released_ms: int | None = None
+    # 是否被当下踩着的选择性延音踏板锁定
+    # (最近一次 sostenuto_down 时键仍按住,且此后选择性踏板未抬起)
+    sost_locked: bool = False
+    # 松键后仍保持该音的踏板集合;None 表示键仍按住或音已结束
+    sustainers: set[str] | None = None
 
 
 def _get_attrs(ev: Any) -> tuple[int, int, str, int | None]:
@@ -44,6 +64,32 @@ def _get_attrs(ev: Any) -> tuple[int, int, str, int | None]:
     return ev.time_ms, ev.channel, ev.type, getattr(ev, "pitch", None)
 
 
+def _lift_pedal(
+    released: dict[int, list[_Voice]],
+    channel: int,
+    pedal: str,
+    time_ms: int,
+) -> None:
+    """某块踏板抬起:从该通道各待释放音的保持集合中移除它。
+
+    保持集合变空的音在 time_ms 截断;仍由另一踏板保持的音保留。
+    """
+    pending = released.get(channel)
+    if not pending:
+        return
+    remaining: list[_Voice] = []
+    for voice in pending:
+        voice.sustainers.discard(pedal)  # type: ignore[union-attr]
+        if voice.sustainers:
+            remaining.append(voice)
+        else:
+            voice.end_ms = time_ms
+    if remaining:
+        released[channel] = remaining
+    else:
+        del released[channel]
+
+
 def _collect(
     end_ms: int, events: Iterable[Any]
 ) -> tuple[list[_Voice], list[dict]]:
@@ -51,10 +97,13 @@ def _collect(
 
     区间的 ``end_ms`` 为 None 表示仍在发声,由调用方按 end_ms 收口。
     """
-    pedal_down: set[int] = set()                 # 正踩着踏板的通道
-    held: dict[tuple[int, int], deque[_Voice]] = {}  # (通道, 音高) -> 仍按住的音
-    pending: dict[int, list[_Voice]] = {}        # 通道 -> 松键后等待抬踏板截断的音
-    voices: list[_Voice] = []                    # 全部发声区间(按 note_on 顺序)
+    sustain_down: set[int] = set()  # 正踩着普通延音踏板的通道
+    sost_down: set[int] = set()     # 正踩着选择性延音踏板的通道
+    # 通道 -> 音高 -> 仍按住的音(FIFO)
+    held: dict[int, dict[int, deque[_Voice]]] = {}
+    # 通道 -> 松键后仍靠踏板发声的音
+    released: dict[int, list[_Voice]] = {}
+    voices: list[_Voice] = []       # 全部发声区间(按 note_on 顺序)
     errors: list[dict] = []
 
     for index, ev in enumerate(events):
@@ -63,40 +112,74 @@ def _collect(
         if kind == "note_on":
             voice = _Voice(channel=channel, pitch=pitch, start_ms=time_ms)
             voices.append(voice)
-            held.setdefault((channel, pitch), deque()).append(voice)
+            held.setdefault(channel, {}).setdefault(pitch, deque()).append(voice)
 
         elif kind == "note_off":
-            queue = held.get((channel, pitch))
+            channel_held = held.get(channel, {})
+            queue = channel_held.get(pitch)
             if not queue:
                 # 没有任何仍按住的同音高按键:松键无法配对
                 errors.append({"index": index, "reason": UNPAIRED_NOTE_OFF})
                 continue
             voice = queue.popleft()  # FIFO:配对最早仍按住的 note_on
             if not queue:
-                del held[(channel, pitch)]
-            if channel in pedal_down:
-                # 踩着踏板:键松开但声音延续,记为待释放
+                del channel_held[pitch]
+            # 松键瞬间能保持该音的踏板:
+            # 普通延音踩着即可;选择性踏板要求该音处于锁定集合
+            sustainers: set[str] = set()
+            if channel in sustain_down:
+                sustainers.add(_SUSTAIN)
+            if channel in sost_down and voice.sost_locked:
+                sustainers.add(_SOSTENUTO)
+            if sustainers:
+                # 键已松开但声音靠踏板延续
                 voice.released_ms = time_ms
-                pending.setdefault(channel, []).append(voice)
+                voice.sustainers = sustainers
+                released.setdefault(channel, []).append(voice)
             else:
                 voice.end_ms = time_ms
 
         elif kind == "pedal_down":
-            if channel in pedal_down:
+            if channel in sustain_down:
                 errors.append({"index": index, "reason": PEDAL_ALREADY_DOWN})
                 # 无效切换不改变状态
             else:
-                pedal_down.add(channel)
+                sustain_down.add(channel)
+                # 踩下普通延音踏板:该通道仍在发声的待释放音
+                # (此时仅可能由选择性踏板保持)改由两块踏板共同保持
+                for voice in released.get(channel, ()):
+                    voice.sustainers.add(_SUSTAIN)  # type: ignore[union-attr]
 
         elif kind == "pedal_up":
-            if channel not in pedal_down:
+            if channel not in sustain_down:
                 errors.append({"index": index, "reason": PEDAL_ALREADY_UP})
                 # 无效切换不改变状态
             else:
-                pedal_down.remove(channel)
-                # 抬起踏板:该通道所有待释放音在同一时刻截断
-                for voice in pending.pop(channel, ()):
-                    voice.end_ms = time_ms
+                sustain_down.remove(channel)
+                _lift_pedal(released, channel, _SUSTAIN, time_ms)
+
+        elif kind == "sostenuto_down":
+            if channel in sost_down:
+                errors.append({"index": index, "reason": SOSTENUTO_ALREADY_DOWN})
+                # 无效切换不改变状态,也不重新锁定(之后新按的音仍不锁定)
+            else:
+                sost_down.add(channel)
+                # 锁定该通道当下仍按住的全部音(各音高 FIFO 中的每个音)
+                for queue in held.get(channel, {}).values():
+                    for voice in queue:
+                        voice.sost_locked = True
+
+        elif kind == "sostenuto_up":
+            if channel not in sost_down:
+                errors.append({"index": index, "reason": SOSTENUTO_ALREADY_UP})
+                # 无效切换不改变状态
+            else:
+                sost_down.remove(channel)
+                # 仍按住的音解除锁定
+                for queue in held.get(channel, {}).values():
+                    for voice in queue:
+                        voice.sost_locked = False
+                _lift_pedal(released, channel, _SOSTENUTO, time_ms)
 
     return voices, errors
 
@@ -139,7 +222,8 @@ def _channel_stats(voices: list[_Voice], end_ms: int) -> list[dict]:
                 deltas[voice.start_ms] = deltas.get(voice.start_ms, 0) + 1
                 deltas[stop_ms] = deltas.get(stop_ms, 0) - 1
             if voice.released_ms is not None:
-                # 松键后靠踏板延续的部分:松键时刻 -> 抬踏板或 end_ms
+                # 松键后靠任一踏板延续的部分:
+                # 松键时刻 -> 最后一块保持踏板抬起(或 end_ms)
                 sustained_duration_ms += stop_ms - voice.released_ms
 
         peak_polyphony = 0

@@ -5,6 +5,8 @@ import unittest
 from app.renderer import (
     PEDAL_ALREADY_DOWN,
     PEDAL_ALREADY_UP,
+    SOSTENUTO_ALREADY_DOWN,
+    SOSTENUTO_ALREADY_UP,
     UNPAIRED_NOTE_OFF,
     render,
     render_stats,
@@ -211,6 +213,260 @@ class RenderTests(unittest.TestCase):
             result["errors"], [{"index": 1, "reason": UNPAIRED_NOTE_OFF}]
         )
 
+    def test_sostenuto_locks_only_currently_held_notes(self):
+        # 踩选择性踏板时 A 仍按住 -> 锁定;之后新按的 B 不锁定
+        result = render(
+            1000,
+            [
+                ev(0, 0, "note_on", 60),   # A
+                ev(100, 0, "sostenuto_down"),
+                ev(150, 0, "note_on", 64),  # B:踩下之后新按,不锁定
+                ev(200, 0, "note_off", 60),  # A:锁定 -> 待释放
+                ev(250, 0, "note_off", 64),  # B:未锁定且无其他踏板 -> 立即结束
+                ev(400, 0, "sostenuto_up"),  # A 截断于 400
+            ],
+        )
+        self.assertEqual(
+            result["intervals"],
+            [
+                {"channel": 0, "pitch": 60, "start_ms": 0, "end_ms": 400},
+                {"channel": 0, "pitch": 64, "start_ms": 150, "end_ms": 250},
+            ],
+        )
+        self.assertEqual(result["errors"], [])
+
+    def test_sostenuto_does_not_lock_already_released_notes(self):
+        # 松键后才踩选择性踏板:已结束的音不会被锁定
+        result = render(
+            1000,
+            [
+                ev(0, 0, "note_on", 60),
+                ev(50, 0, "note_off", 60),  # 立即结束于 50
+                ev(100, 0, "sostenuto_down"),
+                ev(200, 0, "sostenuto_up"),
+            ],
+        )
+        self.assertEqual(
+            result["intervals"],
+            [{"channel": 0, "pitch": 60, "start_ms": 0, "end_ms": 50}],
+        )
+
+    def test_sostenuto_note_still_held_at_up_keeps_ringing(self):
+        # 锁定期间始终没松键,抬踏板不影响该音(键还按着)
+        result = render(
+            1000,
+            [
+                ev(0, 0, "note_on", 60),
+                ev(100, 0, "sostenuto_down"),
+                ev(200, 0, "sostenuto_up"),
+                ev(300, 0, "note_off", 60),  # 此时踏板已抬起 -> 立即结束
+            ],
+        )
+        self.assertEqual(
+            result["intervals"],
+            [{"channel": 0, "pitch": 60, "start_ms": 0, "end_ms": 300}],
+        )
+
+    def test_sostenuto_locked_until_end_ms(self):
+        result = render(
+            1000,
+            [
+                ev(0, 0, "note_on", 60),
+                ev(100, 0, "sostenuto_down"),
+                ev(200, 0, "note_off", 60),  # 锁定 -> 延续
+                # 选择性踏板一直不抬:到 end_ms 截断
+            ],
+        )
+        self.assertEqual(
+            result["intervals"],
+            [{"channel": 0, "pitch": 60, "start_ms": 0, "end_ms": 1000}],
+        )
+
+    def test_sostenuto_fifo_with_repeated_same_pitch(self):
+        # 两个同音高仍按住的音都被锁定,松键按 FIFO 配对
+        result = render(
+            1000,
+            [
+                ev(0, 0, "note_on", 60),
+                ev(50, 0, "note_on", 60),
+                ev(100, 0, "sostenuto_down"),
+                ev(200, 0, "note_off", 60),  # FIFO 配对 0ms 的音 -> 锁定待释放
+                ev(250, 0, "note_off", 60),  # 配对 50ms 的音 -> 锁定待释放
+                ev(400, 0, "sostenuto_up"),  # 两音同时截断于 400
+            ],
+        )
+        self.assertEqual(
+            result["intervals"],
+            [
+                {"channel": 0, "pitch": 60, "start_ms": 0, "end_ms": 400},
+                {"channel": 0, "pitch": 60, "start_ms": 50, "end_ms": 400},
+            ],
+        )
+
+    def test_both_pedals_sustain_up_then_sostenuto_up(self):
+        # 两踏板同踩时松键 -> 共同保持;先抬普通踏板不截断,再抬选择性踏板才结束
+        result = render(
+            1000,
+            [
+                ev(0, 0, "note_on", 60),
+                ev(50, 0, "pedal_down"),
+                ev(100, 0, "sostenuto_down"),
+                ev(200, 0, "note_off", 60),
+                ev(400, 0, "pedal_up"),       # 仍被选择性踏板保持,不截断
+                ev(600, 0, "sostenuto_up"),   # 截断于 600
+            ],
+        )
+        self.assertEqual(
+            result["intervals"],
+            [{"channel": 0, "pitch": 60, "start_ms": 0, "end_ms": 600}],
+        )
+
+    def test_both_pedals_sostenuto_up_first(self):
+        # 反向:先抬选择性踏板,仍由普通延音踏板保持
+        result = render(
+            1000,
+            [
+                ev(0, 0, "note_on", 60),
+                ev(50, 0, "pedal_down"),
+                ev(100, 0, "sostenuto_down"),
+                ev(200, 0, "note_off", 60),
+                ev(400, 0, "sostenuto_up"),  # 仍被普通踏板保持,不截断
+                ev(600, 0, "pedal_up"),      # 截断于 600
+            ],
+        )
+        self.assertEqual(
+            result["intervals"],
+            [{"channel": 0, "pitch": 60, "start_ms": 0, "end_ms": 600}],
+        )
+
+    def test_sostenuto_sustained_then_sustain_takes_over(self):
+        # 仅靠选择性踏板延续的音,之后踩下普通延音踏板也被接管;
+        # 先抬选择性踏板不截断,抬普通踏板才结束
+        result = render(
+            1000,
+            [
+                ev(0, 0, "note_on", 60),
+                ev(50, 0, "sostenuto_down"),
+                ev(100, 0, "note_off", 60),  # 仅选择性踏板保持
+                ev(200, 0, "pedal_down"),    # 普通延音踏板接管
+                ev(300, 0, "sostenuto_up"),  # 仍由普通踏板保持,不截断
+                ev(500, 0, "pedal_up"),      # 截断于 500
+            ],
+        )
+        self.assertEqual(
+            result["intervals"],
+            [{"channel": 0, "pitch": 60, "start_ms": 0, "end_ms": 500}],
+        )
+
+    def test_sostenuto_mixed_locked_and_sustain_pending(self):
+        # 普通延音先踩:松键 A 待释放(仅普通踏板);
+        # 再踩选择性踏板时按住的 B 被锁定;
+        # 松键 B 时两踏板共同保持;抬普通踏板只截断 A,B 保留到选择性踏板抬起
+        result = render(
+            1000,
+            [
+                ev(0, 0, "note_on", 60),    # A
+                ev(50, 0, "pedal_down"),
+                ev(100, 0, "note_off", 60),  # A:仅普通踏板待释放
+                ev(150, 0, "note_on", 64),   # B
+                ev(200, 0, "sostenuto_down"),  # 锁定 B
+                ev(250, 0, "note_off", 64),    # B:两踏板共同保持
+                ev(400, 0, "pedal_up"),        # A 截断于 400;B 保留
+                ev(600, 0, "sostenuto_up"),    # B 截断于 600
+            ],
+        )
+        self.assertEqual(
+            result["intervals"],
+            [
+                {"channel": 0, "pitch": 60, "start_ms": 0, "end_ms": 400},
+                {"channel": 0, "pitch": 64, "start_ms": 150, "end_ms": 600},
+            ],
+        )
+
+    def test_invalid_sostenuto_switches(self):
+        result = render(
+            1000,
+            [
+                ev(0, 0, "sostenuto_down"),
+                ev(10, 0, "sostenuto_down"),  # 重复踩
+                ev(20, 0, "sostenuto_up"),
+                ev(30, 0, "sostenuto_up"),    # 未踩时抬
+            ],
+        )
+        self.assertEqual(
+            result["errors"],
+            [
+                {"index": 1, "reason": SOSTENUTO_ALREADY_DOWN},
+                {"index": 3, "reason": SOSTENUTO_ALREADY_UP},
+            ],
+        )
+
+    def test_repeated_sostenuto_down_does_not_relock_new_notes(self):
+        # 重复踩下无效、不重新锁定:第一次踩下后新按的音,
+        # 在(无效的)第二次踩下时不会被锁定
+        result = render(
+            1000,
+            [
+                ev(0, 0, "note_on", 60),
+                ev(100, 0, "sostenuto_down"),
+                ev(150, 0, "note_on", 64),
+                ev(200, 0, "sostenuto_down"),  # 无效,不重新锁定
+                ev(300, 0, "note_off", 64),    # 64 未锁定 -> 立即结束
+                ev(400, 0, "note_off", 60),    # 60 仍锁定 -> 待释放
+                ev(500, 0, "sostenuto_up"),
+            ],
+        )
+        self.assertEqual(
+            result["intervals"],
+            [
+                {"channel": 0, "pitch": 60, "start_ms": 0, "end_ms": 500},
+                {"channel": 0, "pitch": 64, "start_ms": 150, "end_ms": 300},
+            ],
+        )
+        self.assertEqual(
+            result["errors"],
+            [{"index": 3, "reason": SOSTENUTO_ALREADY_DOWN}],
+        )
+
+    def test_sostenuto_channels_independent(self):
+        result = render(
+            1000,
+            [
+                ev(0, 0, "note_on", 70),
+                ev(0, 0, "sostenuto_down"),
+                ev(0, 1, "note_on", 60),   # 通道1没踩任何踏板
+                ev(10, 1, "note_off", 60),  # 立即截断
+                ev(30, 0, "note_off", 70),  # 通道0锁定 -> 待释放
+            ],
+        )
+        self.assertEqual(
+            result["intervals"],
+            [
+                {"channel": 0, "pitch": 70, "start_ms": 0, "end_ms": 1000},
+                {"channel": 1, "pitch": 60, "start_ms": 0, "end_ms": 10},
+            ],
+        )
+
+    def test_sostenuto_same_timestamp_input_order(self):
+        # 同一时刻:先松键(此时选择性踏板仍踩着 -> 延续),再抬选择性踏板截断
+        result = render(
+            1000,
+            [
+                ev(0, 0, "note_on", 60),
+                ev(10, 0, "sostenuto_down"),
+                ev(20, 0, "note_off", 60),
+                ev(30, 0, "sostenuto_up"),
+                ev(30, 0, "note_on", 60),  # 同刻输入顺序在后:新起的音到 end_ms
+            ],
+        )
+        self.assertEqual(
+            result["intervals"],
+            [
+                {"channel": 0, "pitch": 60, "start_ms": 0, "end_ms": 30},
+                {"channel": 0, "pitch": 60, "start_ms": 30, "end_ms": 1000},
+            ],
+        )
+
 
 class RenderStatsTests(unittest.TestCase):
     def test_total_duration_and_sustained(self):
@@ -395,9 +651,80 @@ class RenderStatsTests(unittest.TestCase):
         # 只有踏板事件的通道不算“出现过按键”
         result = render_stats(
             100,
-            [ev(0, 0, "pedal_down"), ev(10, 0, "pedal_up")],
+            [
+                ev(0, 0, "pedal_down"),
+                ev(10, 0, "pedal_up"),
+                ev(20, 0, "sostenuto_down"),
+                ev(30, 0, "sostenuto_up"),
+            ],
         )
         self.assertEqual(result["stats"], [])
+
+    def test_sostenuto_sustained_duration(self):
+        # 松键后仅靠选择性踏板延续:sustained = 600 - 200 = 400
+        result = render_stats(
+            1000,
+            [
+                ev(0, 0, "note_on", 60),
+                ev(100, 0, "sostenuto_down"),
+                ev(200, 0, "note_off", 60),
+                ev(600, 0, "sostenuto_up"),
+            ],
+        )
+        stats = result["stats"][0]
+        self.assertEqual(stats["total_duration_ms"], 600)
+        self.assertEqual(stats["sustained_duration_ms"], 400)
+        self.assertEqual(stats["peak_polyphony"], 1)
+        self.assertEqual(stats["peak_at_ms"], 0)
+
+    def test_sostenuto_sustained_until_end_ms(self):
+        # 选择性踏板不抬:延续部分计到 end_ms(1000 - 200 = 800)
+        result = render_stats(
+            1000,
+            [
+                ev(0, 0, "note_on", 60),
+                ev(100, 0, "sostenuto_down"),
+                ev(200, 0, "note_off", 60),
+            ],
+        )
+        stats = result["stats"][0]
+        self.assertEqual(stats["total_duration_ms"], 1000)
+        self.assertEqual(stats["sustained_duration_ms"], 800)
+
+    def test_sustained_duration_with_both_pedals(self):
+        # 两踏板共同保持:sustained 只按松键 -> 实际结束计一次(600-200=400),
+        # 不因两块踏板重复计算
+        result = render_stats(
+            1000,
+            [
+                ev(0, 0, "note_on", 60),
+                ev(50, 0, "pedal_down"),
+                ev(100, 0, "sostenuto_down"),
+                ev(200, 0, "note_off", 60),
+                ev(400, 0, "pedal_up"),
+                ev(600, 0, "sostenuto_up"),
+            ],
+        )
+        stats = result["stats"][0]
+        self.assertEqual(stats["total_duration_ms"], 600)
+        self.assertEqual(stats["sustained_duration_ms"], 400)
+
+    def test_unlocked_note_off_under_sostenuto_is_not_sustained(self):
+        # 踩选择性踏板后新按的音松键即结束:不计 sustained
+        result = render_stats(
+            1000,
+            [
+                ev(0, 0, "note_on", 60),
+                ev(50, 0, "sostenuto_down"),
+                ev(100, 0, "note_on", 64),
+                ev(200, 0, "note_off", 64),  # 未锁定,立即结束
+                ev(300, 0, "note_off", 60),  # 锁定,延续到 500
+                ev(500, 0, "sostenuto_up"),
+            ],
+        )
+        stats = result["stats"][0]
+        self.assertEqual(stats["total_duration_ms"], 500 + 100)
+        self.assertEqual(stats["sustained_duration_ms"], 200)
 
     def test_empty_events(self):
         result = render_stats(0, [])
