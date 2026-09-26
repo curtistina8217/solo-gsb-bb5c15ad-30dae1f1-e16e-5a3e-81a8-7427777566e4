@@ -5,6 +5,8 @@ import unittest
 from app.renderer import (
     PEDAL_ALREADY_DOWN,
     PEDAL_ALREADY_UP,
+    SOSTENUTO_ALREADY_DOWN,
+    SOSTENUTO_ALREADY_UP,
     UNPAIRED_NOTE_OFF,
     render,
     render_stats,
